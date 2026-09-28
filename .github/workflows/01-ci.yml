@@ -104,6 +104,7 @@ jobs:
   # =========================================================
   # Terraform - Infrastructure as Code
   # =========================================================
+  # Terraform provisions and manages the Azure infrastructure used by the CI/CD pipeline.
   terraform:
     name: Terraform Validation, Plan and Apply
     runs-on: ubuntu-latest
@@ -201,6 +202,15 @@ jobs:
             --platform linux/amd64 \
             -t ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }} \
             ./${{ matrix.service }}
+
+      - name: Docker Scout security scan
+        uses: docker/scout-action@v1
+        with:
+          command: cves,recommendations
+          image: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
+          summary: true
 
       - name: Push Docker image with commit SHA
         run: |
