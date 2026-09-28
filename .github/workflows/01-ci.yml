@@ -203,6 +203,15 @@ jobs:
             -t ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }} \
             ./${{ matrix.service }}
 
+      - name: Docker Scout security scan
+        uses: docker/scout-action@v1
+        with:
+          command: cves,recommendations
+          image: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
+          summary: true
+
       - name: Push Docker image with commit SHA
         run: |
           docker push \
