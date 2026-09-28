@@ -104,6 +104,7 @@ jobs:
   # =========================================================
   # Terraform - Infrastructure as Code
   # =========================================================
+  # Terraform provisions and manages the Azure infrastructure used by the CI/CD pipeline.
   terraform:
     name: Terraform Validation, Plan and Apply
     runs-on: ubuntu-latest
