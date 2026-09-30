@@ -256,15 +256,20 @@ jobs:
 
           if [ -z "$FRONTEND_IP" ]; then
             echo "Production frontend IP was not available."
+            echo "Result: UNHEALTHY"
             exit 1
           fi
 
           echo "Production frontend IP: $FRONTEND_IP"
+          echo "Starting production HTTP health check..."
+          echo "Total checks: 5"
+          echo "Maximum allowed HTTP error rate: 20%"
 
+          TOTAL_CHECKS=5
           SUCCESS_COUNT=0
 
           for i in {1..5}; do
-            echo "Production health check attempt $i/5"
+            echo "Production health check attempt $i/$TOTAL_CHECKS"
 
             if curl \
               --fail \
@@ -282,14 +287,26 @@ jobs:
             sleep 3
           done
 
-          echo "Successful checks: $SUCCESS_COUNT/5"
+          FAILED_COUNT=$((TOTAL_CHECKS - SUCCESS_COUNT))
+          ERROR_RATE=$((FAILED_COUNT * 100 / TOTAL_CHECKS))
 
-          if [ "$SUCCESS_COUNT" -ge 4 ]; then
+          echo "----------------------------------------"
+          echo "Production health check summary"
+          echo "Successful checks: $SUCCESS_COUNT/$TOTAL_CHECKS"
+          echo "Failed checks: $FAILED_COUNT/$TOTAL_CHECKS"
+          echo "HTTP error rate: $ERROR_RATE%"
+          echo "Maximum allowed HTTP error rate: 20%"
+          echo "----------------------------------------"
+
+          if [ "$ERROR_RATE" -le 20 ]; then
             echo "Production GREEN health check passed."
+            echo "Result: HEALTHY"
             exit 0
           fi
 
           echo "Production GREEN health check failed."
+          echo "Result: UNHEALTHY"
+          echo "Rollback to BLUE is required."
           exit 1
 
       # =========================================================
