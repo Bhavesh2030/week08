@@ -5,7 +5,7 @@ resource_group_name = "koalatech-week08-rg"
 acr_name = "koalatechw08bhaveshacr"
 
 # Must be globally unique and lowercase
-storage_account_name = "koalatechw08bhaveshst"
+storage_account_name = "koalatechw08bhaveshappst"
 
 aks_cluster_name = "koalatech-week08-aks"
 aks_dns_prefix   = "koalatech-week08"
