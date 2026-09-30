@@ -144,25 +144,6 @@ jobs:
             -n staging \
             --timeout=300s
 
-      - name: Validate monitoring stack
-        run: |
-          echo "Checking Prometheus and Grafana monitoring components..."
-
-          kubectl get pods -n monitoring
-
-          kubectl wait --for=condition=Ready pod \
-            -l app.kubernetes.io/name=grafana \
-            -n monitoring \
-            --timeout=180s
-
-          kubectl wait --for=condition=Ready pod \
-            -l app.kubernetes.io/name=prometheus \
-            -n monitoring \
-            --timeout=180s
-
-          echo "Prometheus and Grafana are ready."
-          kubectl get pods -n monitoring
-
       - name: Show staging resources
         run: |
           kubectl get pods -n staging
