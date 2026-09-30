@@ -9,11 +9,20 @@ on:
     branches:
       - main
 
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "Simulate GREEN failure after promotion"
+        required: false
+        default: false
+        type: boolean
+
 jobs:
   deploy-production:
     name: Deploy to Production
     if: >
-      ${{ github.event.workflow_run.conclusion == 'success' }}
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
 
     environment:
@@ -23,7 +32,7 @@ jobs:
       - name: Checkout tested commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - name: Login to Azure
         uses: azure/login@v3
@@ -66,52 +75,282 @@ jobs:
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
+      # =========================================================
+      # Capture the currently stable frontend version
+      # =========================================================
+
+      - name: Capture current BLUE image
+        id: current_blue
+        shell: bash
+        run: |
+          BLUE_IMAGE=$(kubectl get deployment frontend-blue \
+            -n production \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+
+          if [ -n "$BLUE_IMAGE" ] && [ "$BLUE_IMAGE" != "placeholder" ]; then
+            echo "Existing BLUE image: $BLUE_IMAGE"
+            echo "image=$BLUE_IMAGE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LEGACY_IMAGE=$(kubectl get deployment frontend \
+            -n production \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+
+          if [ -n "$LEGACY_IMAGE" ] && [ "$LEGACY_IMAGE" != "placeholder" ]; then
+            echo "Migrating existing frontend image to BLUE: $LEGACY_IMAGE"
+            echo "image=$LEGACY_IMAGE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "No existing stable frontend image found."
+          echo "image=" >> "$GITHUB_OUTPUT"
+
+      # =========================================================
+      # Apply frontend Blue/Green resources
+      # =========================================================
+
       - name: Apply Kubernetes manifests
         run: |
           kubectl apply \
             -f kubernetes/production/
 
-      - name: Update frontend image
+      # =========================================================
+      # Initialise BLUE on the first deployment
+      # =========================================================
+
+      - name: Initialise BLUE if required
         run: |
-          kubectl set image deployment/frontend \
-            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ github.event.workflow_run.head_sha }} \
+          BLUE_IMAGE="${{ steps.current_blue.outputs.image }}"
+
+          if [ -n "$BLUE_IMAGE" ]; then
+            echo "Restoring existing stable BLUE image: $BLUE_IMAGE"
+
+            kubectl set image deployment/frontend-blue \
+              frontend="$BLUE_IMAGE" \
+              -n production
+          else
+            echo "No previous frontend release found."
+            echo "Using the current release as the initial BLUE version."
+
+            kubectl set image deployment/frontend-blue \
+              frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ github.event.workflow_run.head_sha || github.sha }} \
+              -n production
+          fi
+
+          kubectl rollout status deployment/frontend-blue \
+            -n production \
+            --timeout=300s
+
+      # =========================================================
+      # Deploy new GREEN candidate
+      # =========================================================
+
+      - name: Deploy frontend GREEN candidate
+        run: |
+          kubectl set image deployment/frontend-green \
+            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ github.event.workflow_run.head_sha || github.sha }} \
             -n production
+
+          kubectl rollout status deployment/frontend-green \
+            -n production \
+            --timeout=300s
+
+      # =========================================================
+      # Health gate before promotion
+      # =========================================================
+
+      - name: Check GREEN readiness
+        run: |
+          kubectl wait \
+            --for=condition=available \
+            deployment/frontend-green \
+            -n production \
+            --timeout=300s
+
+          READY=$(kubectl get deployment frontend-green \
+            -n production \
+            -o jsonpath='{.status.readyReplicas}')
+
+          DESIRED=$(kubectl get deployment frontend-green \
+            -n production \
+            -o jsonpath='{.spec.replicas}')
+
+          echo "GREEN ready replicas: ${READY:-0}"
+          echo "GREEN desired replicas: $DESIRED"
+
+          if [ "${READY:-0}" != "$DESIRED" ]; then
+            echo "GREEN is not fully ready."
+            exit 1
+          fi
+
+      - name: HTTP smoke test GREEN
+        run: |
+          echo "Testing GREEN through frontend-green-test..."
+
+          kubectl run frontend-green-smoke \
+            -n production \
+            --image=curlimages/curl:8.10.1 \
+            --restart=Never \
+            --rm \
+            --attach \
+            --command -- \
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --retry 10 \
+              --retry-delay 3 \
+              --max-time 10 \
+              http://frontend-green-test
+
+      # =========================================================
+      # Promote GREEN
+      # =========================================================
+
+      - name: Promote GREEN
+        run: |
+          kubectl patch service frontend \
+            -n production \
+            -p '{"spec":{"selector":{"app":"frontend","version":"green"}}}'
+
+          echo "GREEN is now receiving production traffic."
+
+      # =========================================================
+      # Optional controlled failure for HD demonstration
+      # =========================================================
+
+      - name: Simulate GREEN failure
+        if: github.event_name == 'workflow_dispatch' && inputs.simulate_failure == true
+        run: |
+          echo "SIMULATION ENABLED"
+          echo "Scaling GREEN to zero replicas to trigger rollback."
+
+          kubectl scale deployment frontend-green \
+            -n production \
+            --replicas=0
+
+      # =========================================================
+      # Post-deployment health check
+      # =========================================================
+
+      - name: Post-deployment health check
+        id: health_check
+        continue-on-error: true
+        shell: bash
+        run: |
+          FRONTEND_IP=""
+
+          for i in {1..30}; do
+            FRONTEND_IP=$(kubectl get service frontend \
+              -n production \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+            if [ -n "$FRONTEND_IP" ]; then
+              break
+            fi
+
+            echo "Waiting for production frontend IP..."
+            sleep 10
+          done
+
+          if [ -z "$FRONTEND_IP" ]; then
+            echo "Production frontend IP was not available."
+            exit 1
+          fi
+
+          echo "Production frontend IP: $FRONTEND_IP"
+
+          SUCCESS_COUNT=0
+
+          for i in {1..5}; do
+            echo "Production health check attempt $i/5"
+
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 10 \
+              "http://${FRONTEND_IP}"; then
+
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              echo "Health check passed."
+            else
+              echo "Health check failed."
+            fi
+
+            sleep 3
+          done
+
+          echo "Successful checks: $SUCCESS_COUNT/5"
+
+          if [ "$SUCCESS_COUNT" -ge 4 ]; then
+            echo "Production GREEN health check passed."
+            exit 0
+          fi
+
+          echo "Production GREEN health check failed."
+          exit 1
+
+      # =========================================================
+      # Automatic rollback
+      # =========================================================
+
+      - name: Roll back to BLUE
+        if: steps.health_check.outcome == 'failure'
+        run: |
+          echo "GREEN failed the post-deployment health check."
+          echo "Rolling production traffic back to BLUE."
+
+          kubectl patch service frontend \
+            -n production \
+            -p '{"spec":{"selector":{"app":"frontend","version":"blue"}}}'
+
+          echo "Production traffic restored to BLUE."
+
+          kubectl get service frontend \
+            -n production \
+            -o jsonpath='{.spec.selector}'
+
+          echo
+
+      # =========================================================
+      # Update backend services
+      # =========================================================
 
       - name: Update user-service image
         run: |
           kubectl set image deployment/user-service \
-            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ github.event.workflow_run.head_sha }} \
+            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ github.event.workflow_run.head_sha || github.sha }} \
             -n production
 
       - name: Update student-service image
         run: |
           kubectl set image deployment/student-service \
-            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ github.event.workflow_run.head_sha }} \
+            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ github.event.workflow_run.head_sha || github.sha }} \
             -n production
 
       - name: Update lecturer-service image
         run: |
           kubectl set image deployment/lecturer-service \
-            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ github.event.workflow_run.head_sha }} \
+            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ github.event.workflow_run.head_sha || github.sha }} \
             -n production
 
       - name: Update course-service image
         run: |
           kubectl set image deployment/course-service \
-            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ github.event.workflow_run.head_sha }} \
+            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ github.event.workflow_run.head_sha || github.sha }} \
             -n production
 
       - name: Update enrollment-service image
         run: |
           kubectl set image deployment/enrollment-service \
-            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ github.event.workflow_run.head_sha }} \
+            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ github.event.workflow_run.head_sha || github.sha }} \
             -n production
 
-      - name: Wait for frontend rollout
-        run: |
-          kubectl rollout status deployment/frontend \
-            -n production \
-            --timeout=300s
+      # =========================================================
+      # Wait for backend rollouts
+      # =========================================================
 
       - name: Wait for user-service rollout
         run: |
@@ -143,8 +382,38 @@ jobs:
             -n production \
             --timeout=300s
 
+      # =========================================================
+      # Show final production state
+      # =========================================================
+
       - name: Show production resources
         run: |
-          kubectl get pods -n production
+          echo "=== Deployments ==="
+          kubectl get deployments -n production
+
+          echo "=== Pods ==="
+          kubectl get pods -n production -o wide
+
+          echo "=== Services ==="
           kubectl get services -n production
-          kubectl get pvc -n production
+
+          echo "=== Frontend Service Selector ==="
+          kubectl get service frontend \
+            -n production \
+            -o jsonpath='{.spec.selector}'
+
+          echo
+
+          echo "=== Frontend BLUE image ==="
+          kubectl get deployment frontend-blue \
+            -n production \
+            -o jsonpath='{.spec.template.spec.containers[0].image}'
+
+          echo
+
+          echo "=== Frontend GREEN image ==="
+          kubectl get deployment frontend-green \
+            -n production \
+            -o jsonpath='{.spec.template.spec.containers[0].image}'
+
+          echo
